@@ -260,7 +260,7 @@ local function loadWindUI()
                 return cachedLib
             end
             if cacheErrorType == "runtime" or cacheErrorType == "api" then
-                warn("[bones hub] WindUI 缓存不兼容，使用轻量 UI: " .. tostring(cacheError))
+                warn("[gaogao] WindUI 缓存不兼容，使用轻量 UI: " .. tostring(cacheError))
                 return createFallbackUI()
             end
             pcall(function()
@@ -271,12 +271,12 @@ local function loadWindUI()
 
     local downloadOk, source = pcall(game.HttpGet, game, WINDUI_URL)
     if not downloadOk then
-        warn("[bones hub] WindUI 下载失败，使用轻量 UI: " .. tostring(source))
+        warn("[gaogao] WindUI 下载失败，使用轻量 UI: " .. tostring(source))
         return createFallbackUI()
     end
     local lib, loadError = executeWindUISource(source)
     if not lib then
-        warn("[bones hub] WindUI 运行失败，使用轻量 UI: " .. tostring(loadError))
+        warn("[gaogao] WindUI 运行失败，使用轻量 UI: " .. tostring(loadError))
         return createFallbackUI()
     end
 
@@ -594,7 +594,7 @@ local function makeBonesEmbed(title, privateLink, timestamp, color)
 end
 
 local function sendBiomeWebhook(biome)
-    if _G.BonesHubWebhookRunToken ~= WEBHOOK_RUN_TOKEN then return end
+    if _G.gaogaoWebhookRunToken ~= WEBHOOK_RUN_TOKEN then return end
     local ok, err = pcall(function()
         if webhookUrl == "" or not webhookEnabled or not webhookWaterEnabled then return end
         if not validPrivateServerLink(privateServerUrl) then return end
