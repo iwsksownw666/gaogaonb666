@@ -1,5 +1,3 @@
--- ts file was generated at discord.gg/25ms
-
 local genv = getgenv()
 local fenv = getfenv()
 
