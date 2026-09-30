@@ -27,9 +27,16 @@ local Config = {
     StuckWindow = 1.6,
     WaypointSpacing = 4,
     DirectMoveRange = 14,
-    JumpCooldown = 0.9,
+    JumpCooldown = 0.7,
+    JumpRetryWindow = 1.15,
+    JumpTriggerDistance = 5.5,
     HeightJumpThreshold = 1.6,
-    MaxHeightJump = 8,
+    MaxHeightJump = 10,
+
+    ShowPath = true,
+    PathColor = Color3.fromRGB(50, 255, 90),
+    PathThickness = 0.18,
+    PathHeight = 0.35,
 
     EnterCooldown = 4,
     EnterBackoffBase = 8,
@@ -86,6 +93,56 @@ local function resetSticky(reason)
 end
 
 local Controls = nil
+local PathVisualFolder = nil
+
+local function clearPathVisual()
+    if PathVisualFolder then
+        PathVisualFolder:Destroy()
+        PathVisualFolder = nil
+    end
+end
+
+local function renderPathVisual(rootPosition, waypoints, startIndex, finalTarget)
+    clearPathVisual()
+
+    if not Config.ShowPath then
+        return
+    end
+
+    local folder = Instance.new("Folder")
+    folder.Name = "BonesWatermelonPath"
+    folder.Parent = Workspace
+    PathVisualFolder = folder
+
+    local points = { rootPosition + Vector3.new(0, Config.PathHeight, 0) }
+    for i = startIndex or 1, #waypoints do
+        points[#points + 1] = waypoints[i].Position + Vector3.new(0, Config.PathHeight, 0)
+    end
+    if finalTarget and (points[#points] - finalTarget).Magnitude > 0.5 then
+        points[#points + 1] = finalTarget + Vector3.new(0, Config.PathHeight, 0)
+    end
+
+    for i = 1, #points - 1 do
+        local from = points[i]
+        local to = points[i + 1]
+        local length = (to - from).Magnitude
+        if length > 0.05 then
+            local segment = Instance.new("Part")
+            segment.Name = "PathSegment"
+            segment.Anchored = true
+            segment.CanCollide = false
+            segment.CanTouch = false
+            segment.CanQuery = false
+            segment.CastShadow = false
+            segment.Material = Enum.Material.Neon
+            segment.Color = Config.PathColor
+            segment.Transparency = 0.08
+            segment.Size = Vector3.new(Config.PathThickness, Config.PathThickness, length)
+            segment.CFrame = CFrame.lookAt((from + to) * 0.5, to)
+            segment.Parent = folder
+        end
+    end
+end
 
 local function captureControls(enabled)
     if not Controls then
@@ -115,6 +172,7 @@ function State.Stop()
     State.Stopped = true
     Config.Enabled = false
     captureControls(false)
+    clearPathVisual()
     pcall(function()
         local character = LocalPlayer.Character
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -138,6 +196,7 @@ function State.SetEnabled(enabled)
         log("enabled")
     else
         captureControls(false)
+        clearPathVisual()
         pcall(function()
             local character = LocalPlayer.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -328,16 +387,26 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
     local lastGoal = nil
     local lastMoveAt = 0
     local lastJumpAt = 0
-    local stuckJumps = 0
+    local jumpAttemptIndex = 0
+    local jumpAttemptAt = 0
     local lastPos = root.Position
     local lastProgressAt = startedAt
-    local strafeUntil = 0
-    local strafeSign = 1
+    local directVisualGoal = nil
 
     local function horiz(a, b)
         local dx = a.X - b.X
         local dz = a.Z - b.Z
         return math.sqrt(dx * dx + dz * dz)
+    end
+
+    local function finish(ok, reason)
+        clearPathVisual()
+        if ok then
+            pcall(function()
+                humanoid:Move(Vector3.zero)
+            end)
+        end
+        return ok, reason
     end
 
     local function computePath(target)
@@ -364,6 +433,10 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
                 waypoints = computedWaypoints
                 index = 1
                 pathGoal = target
+                jumpAttemptIndex = 0
+                jumpAttemptAt = 0
+                directVisualGoal = nil
+                renderPathVisual(root.Position, waypoints, index, target)
                 return true
             end
         end
@@ -371,19 +444,23 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         waypoints = {}
         index = 1
         nextPathAt = os.clock() + 1
+        if not directVisualGoal or (directVisualGoal - target).Magnitude > 1 then
+            directVisualGoal = target
+            renderPathVisual(root.Position, {}, 1, target)
+        end
         return false
     end
 
     while not State.Stopped and os.clock() - startedAt < timeout do
         local target = getTargetPosition()
         if not target then
-            return false, "target disappeared"
+            return finish(false, "target disappeared")
         end
 
         if not root.Parent or humanoid.Health <= 0 then
             local _, newHumanoid, newRoot = getCharacter(10)
             if not newHumanoid or not newRoot then
-                return false, "character respawn failed"
+                return finish(false, "character respawn failed")
             end
 
             humanoid, root = newHumanoid, newRoot
@@ -393,11 +470,12 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
             lastGoal = nil
             lastPos = root.Position
             lastProgressAt = os.clock()
+            clearPathVisual()
         end
 
         if root.Position.Y < Config.VoidY then
             pcall(function() humanoid:Move(Vector3.zero) end)
-            return false, "fell out of the map"
+            return finish(false, "fell out of the map")
         end
 
         local now = os.clock()
@@ -405,16 +483,20 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         local deltaY = target.Y - root.Position.Y
 
         if flat <= stopDistance and math.abs(deltaY) <= 7 then
-            pcall(function() humanoid:Move(Vector3.zero) end)
-            return true
+            return finish(true)
         end
 
         local goal
+        local activeWaypoint
 
         if flat <= Config.DirectMoveRange and math.abs(deltaY) <= 2.5 then
             waypoints = {}
             index = 1
             goal = target
+            if not directVisualGoal or (directVisualGoal - target).Magnitude > 1 then
+                directVisualGoal = target
+                renderPathVisual(root.Position, {}, 1, target)
+            end
         else
             if usePathfinding then
                 local stale = #waypoints > 0 and pathGoal and (pathGoal - target).Magnitude > 8
@@ -428,16 +510,31 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
                 end
             end
 
-            local waypoint = (index <= #waypoints) and waypoints[index] or nil
+            activeWaypoint = (index <= #waypoints) and waypoints[index] or nil
 
-            if waypoint
-                and horiz(root.Position, waypoint.Position) <= Config.WaypointSpacing * 0.9
-                and math.abs(root.Position.Y - waypoint.Position.Y) <= 7 then
-                index += 1
-                waypoint = (index <= #waypoints) and waypoints[index] or nil
+            -- A jump waypoint is not consumed until the Humanoid actually
+            -- leaves the floor. A blocked jump therefore remains active and
+            -- is retried after JumpRetryWindow instead of being avoided.
+            if activeWaypoint and horiz(root.Position, activeWaypoint.Position) <= Config.WaypointSpacing * 0.9 then
+                if activeWaypoint.Action ~= Enum.PathWaypointAction.Jump then
+                    index += 1
+                    jumpAttemptIndex = 0
+                    jumpAttemptAt = 0
+                elseif jumpAttemptIndex == index and humanoid.FloorMaterial == Enum.Material.Air then
+                    index += 1
+                    jumpAttemptIndex = 0
+                    jumpAttemptAt = 0
+                elseif jumpAttemptIndex == index
+                    and jumpAttemptAt > 0
+                    and now - jumpAttemptAt >= Config.JumpRetryWindow then
+                        lastJumpAt = 0
+                        jumpAttemptAt = 0
+                end
+
+                activeWaypoint = (index <= #waypoints) and waypoints[index] or nil
             end
 
-            goal = waypoint and waypoint.Position or target
+            goal = activeWaypoint and activeWaypoint.Position or target
         end
 
         local moved = (root.Position - lastPos).Magnitude
@@ -445,50 +542,44 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         if moved >= Config.StuckDistance then
             lastPos = root.Position
             lastProgressAt = now
-            stuckJumps = 0
-            strafeUntil = 0
         elseif now - lastProgressAt >= Config.StuckWindow then
             lastProgressAt = now
-            strafeUntil = now + 0.9
-            strafeSign = -strafeSign
 
             if usePathfinding then
                 waypoints = {}
                 index = 1
                 nextPathAt = 0
+                jumpAttemptIndex = 0
+                jumpAttemptAt = 0
+                clearPathVisual()
             end
 
             lastGoal = nil
         end
 
         local moveGoal = goal
-
-        if now < strafeUntil then
-            local direction = goal - root.Position
-            local perpendicular = Vector3.new(-direction.Z, 0, direction.X)
-            if perpendicular.Magnitude > 0.001 then
-                moveGoal = root.Position + perpendicular.Unit * 7 * strafeSign
-            end
-        end
-
         local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
-        local activeWaypoint = (index <= #waypoints) and waypoints[index] or nil
         local wantsJump = false
 
         if allowJumps and grounded then
-            if activeWaypoint and activeWaypoint.Action == Enum.PathWaypointAction.Jump then
+            if activeWaypoint
+                and activeWaypoint.Action == Enum.PathWaypointAction.Jump
+                and horiz(root.Position, activeWaypoint.Position) <= Config.JumpTriggerDistance then
                 wantsJump = true
             elseif deltaY >= Config.HeightJumpThreshold and deltaY <= Config.MaxHeightJump and flat <= 16 then
-                wantsJump = true
-            elseif now < strafeUntil and stuckJumps < 2 then
                 wantsJump = true
             end
         end
 
         if wantsJump and now - lastJumpAt >= Config.JumpCooldown then
             lastJumpAt = now
-            if now < strafeUntil then
-                stuckJumps += 1
+            if activeWaypoint and activeWaypoint.Action == Enum.PathWaypointAction.Jump then
+                jumpAttemptIndex = index
+                jumpAttemptAt = now
+                local afterJump = waypoints[index + 1]
+                if afterJump then
+                    moveGoal = afterJump.Position
+                end
             end
             pcall(function()
                 humanoid.Jump = true
@@ -506,7 +597,7 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
     end
 
     pcall(function() humanoid:Move(Vector3.zero) end)
-    return false, "move timeout"
+    return finish(false, "move timeout")
 end
 
 local function waitForChild(parent, name, timeout)
@@ -648,11 +739,8 @@ local function resetDialog(timeout)
     end
 
     if getDialog() then
-        -- The server never closed it. Hide the stale panel so the next
-        -- interaction can raise a fresh dialog instead of reading leftovers.
-        pcall(function()
-            getDialog().Visible = false
-        end)
+        -- Keep the game's internal dialog controller authoritative. Directly
+        -- changing Visible leaves its state machine open and breaks round two.
         cancelDialog()
         task.wait(0.2)
     end
@@ -745,30 +833,38 @@ local function startMinigameDialog(prompt)
 
     setPhase("selecting_minigame")
 
-    local sendCount = 0
-    local confirmDeadline = os.clock() + 6
+    if not DialogPackets then
+        return false, "dialog packets unavailable"
+    end
 
-    while not State.Stopped and sendCount < 3 and os.clock() < confirmDeadline do
-        sendCount += 1
-        if not DialogPackets then
-            return false, "dialog packets unavailable"
-        end
-        pcall(function()
-            DialogPackets.DialogResult.send("Minigame")
-        end)
+    -- Verified Lime chain:
+    -- [Minigame] -> [-1 Minigame Ticket] -> start round -> CancelDialog.
+    -- Finish both server choices first, then close through the game's packet.
+    pcall(function()
+        DialogPackets.DialogResult.send("Minigame")
+    end)
 
-        local windowEnd = os.clock() + (sendCount == 1 and 1.6 or 1.2)
-        while not State.Stopped and os.clock() < windowEnd do
-            task.wait(0.05)
-            if findChoice() == nil then
-                break
-            end
-        end
-
-        if not getDialog() then
+    setPhase("confirming_ticket")
+    local secondChoiceDeadline = os.clock() + 2.5
+    repeat
+        task.wait(0.05)
+        local visibleChoice = tostring(findChoice() or "")
+        if string.find(visibleChoice, "-1", 1, true) then
             break
         end
+    until State.Stopped or os.clock() >= secondChoiceDeadline
+
+    if State.Stopped then
+        return false, "stopped"
     end
+
+    pcall(function()
+        DialogPackets.DialogResult.send("Minigame")
+    end)
+
+    task.wait(0.05)
+    setPhase("closing_dialog")
+    cancelDialog()
 
     return true
 end
