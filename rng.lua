@@ -44,11 +44,14 @@ local Config = {
     PathHeight = 0.35,
     AssistRamps = true,
     AssistRampColor = Color3.fromRGB(70, 255, 110),
-    AssistRampWidth = 5,
-    AssistRampThickness = 0.7,
-    AssistRampSlope = 20,
-    AssistRampMaxRise = 14,
-    AssistRampMaxCount = 4,
+    AssistRampWidth = 7,
+    AssistRampThickness = 2.25,
+    AssistRampSlope = 18,
+    AssistRampMinRise = 5.5,
+    AssistRampMaxRise = 32,
+    AssistRampMaxCount = 1,
+    AssistRampBottomOverlap = 2.5,
+    AssistRampTopOverlap = 3.5,
 
     EnterCooldown = 4,
     EnterBackoffBase = 8,
@@ -145,7 +148,7 @@ local function rampKey(bottom, top)
     )
 end
 
-local function createAssistRamp(bottomFloor, topFloor, direction)
+local function createAssistRamp(bottomFloor, topFloor, direction, fixedName)
     local rise = topFloor.Y - bottomFloor.Y
     if rise < 0.75 or rise > Config.AssistRampMaxRise then
         return
@@ -165,24 +168,27 @@ local function createAssistRamp(bottomFloor, topFloor, direction)
     flatDirection = flatDirection.Unit
 
     local minimumRun = rise / math.tan(math.rad(Config.AssistRampSlope))
-    local top = topFloor + Vector3.new(0, 0.15, 0)
+    local top = topFloor + Vector3.new(0, 0.2, 0)
     local bottom = bottomFloor + Vector3.new(0, 0.15, 0)
     local currentRun = Vector3.new(top.X - bottom.X, 0, top.Z - bottom.Z).Magnitude
     if currentRun < minimumRun then
         bottom -= flatDirection * (minimumRun - currentRun)
     end
+    bottom -= flatDirection * Config.AssistRampBottomOverlap
+    top += flatDirection * Config.AssistRampTopOverlap
     local incline = top - bottom
     if incline.Magnitude < 1 then
         return
     end
 
     local folder = getAssistRampFolder()
-    if #folder:GetChildren() >= Config.AssistRampMaxCount then
-        return
+    local key = fixedName or rampKey(bottom, top)
+    local existing = folder:FindFirstChild(key)
+    if existing then
+        return existing
     end
-    local key = rampKey(bottom, top)
-    if folder:FindFirstChild(key) then
-        return
+    if #folder:GetChildren() >= Config.AssistRampMaxCount then
+        return nil
     end
 
     local orientation = CFrame.lookAt((bottom + top) * 0.5, top)
@@ -191,11 +197,11 @@ local function createAssistRamp(bottomFloor, topFloor, direction)
     ramp.Anchored = true
     ramp.CanCollide = true
     ramp.CanTouch = false
-    ramp.CanQuery = false
+    ramp.CanQuery = true
     ramp.CastShadow = false
     ramp.Material = Enum.Material.SmoothPlastic
     ramp.Color = Config.AssistRampColor
-    ramp.Transparency = 0.55
+    ramp.Transparency = 0.2
     ramp.Size = Vector3.new(
         Config.AssistRampWidth,
         Config.AssistRampThickness,
@@ -203,6 +209,7 @@ local function createAssistRamp(bottomFloor, topFloor, direction)
     )
     ramp.CFrame = orientation * CFrame.new(0, -Config.AssistRampThickness * 0.5, 0)
     ramp.Parent = folder
+    return ramp
 end
 
 local function buildAssistRamps(waypoints)
@@ -210,50 +217,26 @@ local function buildAssistRamps(waypoints)
         return
     end
 
-    local i = 1
-    while i < #waypoints do
+    for i = 1, #waypoints - 1 do
         local current = waypoints[i]
-        local topIndex = nil
-        local highestRise = 0
+        local following = waypoints[i + 1]
+        local rise = following.Position.Y - current.Position.Y
+        local flat = Vector3.new(
+            following.Position.X - current.Position.X,
+            0,
+            following.Position.Z - current.Position.Z
+        ).Magnitude
+        local tooHighToJump = rise >= Config.AssistRampMinRise
+            and rise <= Config.AssistRampMaxRise
+        local nearVertical = rise / math.max(flat, 0.5) >= 0.65
 
-        -- Pathfinding sometimes labels a sharp ledge as Walk. Scan several
-        -- points ahead and build for every meaningful climb, independent of
-        -- the waypoint action.
-        for j = i + 1, math.min(i + 3, #waypoints) do
-            local rise = waypoints[j].Position.Y - current.Position.Y
-            local flat = Vector3.new(
-                waypoints[j].Position.X - current.Position.X,
-                0,
-                waypoints[j].Position.Z - current.Position.Z
-            ).Magnitude
-            local steep = rise / math.max(flat, 0.5)
-            local markedJump = current.Action == Enum.PathWaypointAction.Jump
-            if rise > highestRise
-                and rise <= Config.AssistRampMaxRise
-                and (markedJump or steep >= 0.22) then
-                highestRise = rise
-                topIndex = j
-            end
-        end
-
-        if topIndex and highestRise >= 0.75 then
-            for j = topIndex + 1, math.min(topIndex + 3, #waypoints) do
-                local totalRise = waypoints[j].Position.Y - current.Position.Y
-                if totalRise > highestRise and totalRise <= Config.AssistRampMaxRise then
-                    highestRise = totalRise
-                    topIndex = j
-                end
-            end
-
-            local following = waypoints[topIndex]
+        if tooHighToJump and nearVertical then
             local direction = following.Position - current.Position
             if Vector3.new(direction.X, 0, direction.Z).Magnitude < 0.1 and i > 1 then
                 direction = current.Position - waypoints[i - 1].Position
             end
-            createAssistRamp(current.Position, following.Position, direction)
-            i = topIndex + 1
-        else
-            i += 1
+            createAssistRamp(current.Position, following.Position, direction, "FixedPathRamp")
+            return
         end
     end
 end
@@ -520,6 +503,7 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
     local sampleApproaches = options.SampleApproaches == true
     local requireLineOfSight = options.RequireLineOfSight == true
     local ignoredTarget = options.IgnoreInstance
+    local adaptiveRampMode = options.AdaptiveRamp == true
 
     local character, humanoid, root = getCharacter(10)
     if not character or not humanoid or not root then
@@ -542,7 +526,6 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
     local directVisualGoal = nil
     local fallbackGoal = nil
     local approachAttempt = 0
-
     local function horiz(a, b)
         local dx = a.X - b.X
         local dz = a.Z - b.Z
@@ -653,6 +636,49 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         return lowHit ~= nil, lowHit, headHit
     end
 
+    local function tryCreateBlockedRamp(goal, lowHit, headHit)
+        if not adaptiveRampMode
+            or not Config.AssistRamps
+            or not lowHit
+            or not headHit
+            or not lowHit.Instance:IsA("BasePart") then
+            return false
+        end
+
+        local obstacle = lowHit.Instance
+        local bottomFloor = root.Position - Vector3.new(0, 3, 0)
+        local topY = obstacle.Position.Y + obstacle.Size.Y * 0.5
+        local rise = topY - bottomFloor.Y
+        if rise < Config.AssistRampMinRise or rise > Config.AssistRampMaxRise then
+            return false
+        end
+
+        local folder = getAssistRampFolder()
+        if #folder:GetChildren() > 0 then
+            return true
+        end
+
+        local forward = Vector3.new(
+            goal.X - root.Position.X,
+            0,
+            goal.Z - root.Position.Z
+        )
+        if forward.Magnitude < 0.1 then
+            forward = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+        end
+        if forward.Magnitude < 0.1 then
+            return false
+        end
+        forward = forward.Unit
+
+        local topFloor = Vector3.new(
+            lowHit.Position.X + forward.X * 2.5,
+            topY,
+            lowHit.Position.Z + forward.Z * 2.5
+        )
+        return createAssistRamp(bottomFloor, topFloor, forward, "FixedObstacleRamp") ~= nil
+    end
+
     local function finish(ok, reason)
         clearPathVisual()
         if ok then
@@ -715,8 +741,9 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
             jumpAttemptAt = 0
             directVisualGoal = nil
             renderPathVisual(root.Position, waypoints, index, target)
-            clearAssistRamps()
-            buildAssistRamps(waypoints)
+            if adaptiveRampMode then
+                buildAssistRamps(waypoints)
+            end
             return true
         end
 
@@ -738,7 +765,6 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         if not target then
             return finish(false, "target disappeared")
         end
-
         if not root.Parent or humanoid.Health <= 0 then
             local newCharacter, newHumanoid, newRoot = getCharacter(10)
             if not newCharacter or not newHumanoid or not newRoot then
@@ -830,24 +856,10 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         elseif now - lastProgressAt >= Config.StuckWindow then
             lastProgressAt = now
 
-            if Config.AssistRamps and #waypoints > 0 then
-                local bottomFloor = root.Position - Vector3.new(0, 4, 0)
-                local emergencyTop = nil
-                for j = index, math.min(index + 4, #waypoints) do
-                    local point = waypoints[j].Position
-                    if point.Y - bottomFloor.Y >= 0.75
-                        and horiz(root.Position, point) <= 20
-                        and (not emergencyTop or point.Y > emergencyTop.Y) then
-                            emergencyTop = point
-                    end
-                end
-
-                if emergencyTop then
-                    local direction = emergencyTop - bottomFloor
-                    if Vector3.new(direction.X, 0, direction.Z).Magnitude < 0.1 then
-                        direction = root.CFrame.LookVector
-                    end
-                    createAssistRamp(bottomFloor, emergencyTop, direction)
+            if adaptiveRampMode then
+                local blocked, lowHit, headHit = hasJumpableObstacle(goal or target)
+                if blocked then
+                    tryCreateBlockedRamp(goal or target, lowHit, headHit)
                 end
             end
 
@@ -886,26 +898,8 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
                         wantsJump = headHit == nil
                         obstacleJump = wantsJump
 
-                        if Config.AssistRamps
-                            and obstacleHit
-                            and obstacleHit.Instance:IsA("BasePart") then
-                                local forward = Vector3.new(
-                                    moveGoal.X - root.Position.X,
-                                    0,
-                                    moveGoal.Z - root.Position.Z
-                                )
-                                if forward.Magnitude > 0.1 then
-                                    forward = forward.Unit
-                                    local obstacle = obstacleHit.Instance
-                                    local topY = obstacle.Position.Y + obstacle.Size.Y * 0.5
-                                    local bottomFloor = root.Position - Vector3.new(0, 4, 0)
-                                    local topFloor = Vector3.new(
-                                        obstacleHit.Position.X + forward.X * 2,
-                                        topY,
-                                        obstacleHit.Position.Z + forward.Z * 2
-                                    )
-                                    createAssistRamp(bottomFloor, topFloor, forward)
-                                end
+                        if not wantsJump then
+                            tryCreateBlockedRamp(moveGoal, obstacleHit, headHit)
                         end
                     end
             end
@@ -1369,6 +1363,7 @@ end
 
 local function collectRoutine(prompt)
     setPhase("moving_to_watermelon")
+    clearAssistRamps()
 
     local targetPart = getPromptPart(prompt)
     if not targetPart then
@@ -1385,6 +1380,7 @@ local function collectRoutine(prompt)
         SampleApproaches = true,
         RequireLineOfSight = prompt.RequiresLineOfSight,
         IgnoreInstance = targetContainer,
+        AdaptiveRamp = true,
     })
 
     if not moved then
