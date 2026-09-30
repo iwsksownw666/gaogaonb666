@@ -15,7 +15,7 @@ end
 
 local Config = {
     Enabled = true,
-    WalkSpeed = 24,
+    WalkSpeed = 16,
     MoveTimeout = 45,
     DialogTimeout = 12,
     StartTimeout = 15,
@@ -24,12 +24,17 @@ local Config = {
     IdleWait = 0.25,
 
     StuckDistance = 0.6,
-    StuckWindow = 1.6,
+    StuckWindow = 0.8,
     WaypointSpacing = 4,
     DirectMoveRange = 14,
-    JumpCooldown = 0.7,
+    JumpCooldown = 0.9,
     JumpRetryWindow = 1.15,
     JumpTriggerDistance = 5.5,
+    ObstacleCheckDistance = 4.5,
+    ObstacleJumpCooldown = 1.25,
+    ApproachSampleRadius = 6,
+    ApproachClearanceHeight = 5.5,
+    ApproachSamples = 8,
     HeightJumpThreshold = 1.6,
     MaxHeightJump = 10,
 
@@ -37,11 +42,17 @@ local Config = {
     PathColor = Color3.fromRGB(50, 255, 90),
     PathThickness = 0.18,
     PathHeight = 0.35,
+    AssistRamps = true,
+    AssistRampColor = Color3.fromRGB(70, 255, 110),
+    AssistRampWidth = 5,
+    AssistRampThickness = 0.7,
+    AssistRampSlope = 20,
+    AssistRampMaxRise = 14,
+    AssistRampMaxCount = 4,
 
     EnterCooldown = 4,
     EnterBackoffBase = 8,
     EnterBackoffMax = 60,
-    BlacklistTime = 25,
     WatchdogTimeout = 150,
     VoidY = -80,
     VoidGrace = 6,
@@ -94,11 +105,156 @@ end
 
 local Controls = nil
 local PathVisualFolder = nil
+local AssistRampFolder = nil
 
 local function clearPathVisual()
     if PathVisualFolder then
         PathVisualFolder:Destroy()
         PathVisualFolder = nil
+    end
+end
+
+local function clearAssistRamps()
+    if AssistRampFolder then
+        AssistRampFolder:Destroy()
+        AssistRampFolder = nil
+    end
+end
+
+local function getAssistRampFolder()
+    if AssistRampFolder and AssistRampFolder.Parent then
+        return AssistRampFolder
+    end
+
+    local folder = Instance.new("Folder")
+    folder.Name = "BonesWatermelonRamps"
+    folder.Parent = Workspace
+    AssistRampFolder = folder
+    return folder
+end
+
+local function rampKey(bottom, top)
+    return string.format(
+        "Ramp_%d_%d_%d_%d_%d_%d",
+        math.round(bottom.X),
+        math.round(bottom.Y),
+        math.round(bottom.Z),
+        math.round(top.X),
+        math.round(top.Y),
+        math.round(top.Z)
+    )
+end
+
+local function createAssistRamp(bottomFloor, topFloor, direction)
+    local rise = topFloor.Y - bottomFloor.Y
+    if rise < 0.75 or rise > Config.AssistRampMaxRise then
+        return
+    end
+
+    local actualFlat = Vector3.new(
+        topFloor.X - bottomFloor.X,
+        0,
+        topFloor.Z - bottomFloor.Z
+    )
+    local flatDirection = actualFlat.Magnitude >= 0.1
+        and actualFlat
+        or Vector3.new(direction.X, 0, direction.Z)
+    if flatDirection.Magnitude < 0.1 then
+        return
+    end
+    flatDirection = flatDirection.Unit
+
+    local minimumRun = rise / math.tan(math.rad(Config.AssistRampSlope))
+    local top = topFloor + Vector3.new(0, 0.15, 0)
+    local bottom = bottomFloor + Vector3.new(0, 0.15, 0)
+    local currentRun = Vector3.new(top.X - bottom.X, 0, top.Z - bottom.Z).Magnitude
+    if currentRun < minimumRun then
+        bottom -= flatDirection * (minimumRun - currentRun)
+    end
+    local incline = top - bottom
+    if incline.Magnitude < 1 then
+        return
+    end
+
+    local folder = getAssistRampFolder()
+    if #folder:GetChildren() >= Config.AssistRampMaxCount then
+        return
+    end
+    local key = rampKey(bottom, top)
+    if folder:FindFirstChild(key) then
+        return
+    end
+
+    local orientation = CFrame.lookAt((bottom + top) * 0.5, top)
+    local ramp = Instance.new("Part")
+    ramp.Name = key
+    ramp.Anchored = true
+    ramp.CanCollide = true
+    ramp.CanTouch = false
+    ramp.CanQuery = false
+    ramp.CastShadow = false
+    ramp.Material = Enum.Material.SmoothPlastic
+    ramp.Color = Config.AssistRampColor
+    ramp.Transparency = 0.55
+    ramp.Size = Vector3.new(
+        Config.AssistRampWidth,
+        Config.AssistRampThickness,
+        incline.Magnitude + 0.8
+    )
+    ramp.CFrame = orientation * CFrame.new(0, -Config.AssistRampThickness * 0.5, 0)
+    ramp.Parent = folder
+end
+
+local function buildAssistRamps(waypoints)
+    if not Config.AssistRamps then
+        return
+    end
+
+    local i = 1
+    while i < #waypoints do
+        local current = waypoints[i]
+        local topIndex = nil
+        local highestRise = 0
+
+        -- Pathfinding sometimes labels a sharp ledge as Walk. Scan several
+        -- points ahead and build for every meaningful climb, independent of
+        -- the waypoint action.
+        for j = i + 1, math.min(i + 3, #waypoints) do
+            local rise = waypoints[j].Position.Y - current.Position.Y
+            local flat = Vector3.new(
+                waypoints[j].Position.X - current.Position.X,
+                0,
+                waypoints[j].Position.Z - current.Position.Z
+            ).Magnitude
+            local steep = rise / math.max(flat, 0.5)
+            local markedJump = current.Action == Enum.PathWaypointAction.Jump
+            if rise > highestRise
+                and rise <= Config.AssistRampMaxRise
+                and (markedJump or steep >= 0.22) then
+                highestRise = rise
+                topIndex = j
+            end
+        end
+
+        if topIndex and highestRise >= 0.75 then
+            for j = topIndex + 1, math.min(topIndex + 3, #waypoints) do
+                local totalRise = waypoints[j].Position.Y - current.Position.Y
+                if totalRise > highestRise and totalRise <= Config.AssistRampMaxRise then
+                    highestRise = totalRise
+                    topIndex = j
+                end
+            end
+
+            local following = waypoints[topIndex]
+            local direction = following.Position - current.Position
+            if Vector3.new(direction.X, 0, direction.Z).Magnitude < 0.1 and i > 1 then
+                direction = current.Position - waypoints[i - 1].Position
+            end
+            createAssistRamp(current.Position, following.Position, direction)
+            i = topIndex + 1
+        else
+            i += 1
+        end
     end
 end
 
@@ -173,6 +329,7 @@ function State.Stop()
     Config.Enabled = false
     captureControls(false)
     clearPathVisual()
+    clearAssistRamps()
     pcall(function()
         local character = LocalPlayer.Character
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -197,6 +354,7 @@ function State.SetEnabled(enabled)
     else
         captureControls(false)
         clearPathVisual()
+        clearAssistRamps()
         pcall(function()
             local character = LocalPlayer.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -274,17 +432,6 @@ local function getPromptPart(prompt)
     return nil
 end
 
-local Blacklist = setmetatable({}, { __mode = "k" })
-
-local function blacklistPrompt(prompt)
-    Blacklist[prompt] = os.clock() + Config.BlacklistTime
-end
-
-local function isBlacklisted(prompt)
-    local expiry = Blacklist[prompt]
-    return expiry ~= nil and os.clock() < expiry
-end
-
 local ScanCache = { prompt = nil, at = 0, fullAt = 0 }
 
 local function collectPromptCandidates(out)
@@ -334,7 +481,6 @@ local function findWatermelonPrompt()
     if cached
         and cached.Parent
         and cached.Enabled
-        and not isBlacklisted(cached)
         and now - ScanCache.at < 0.25 then
         return cached
     end
@@ -346,21 +492,19 @@ local function findWatermelonPrompt()
     local best, bestDistance = nil, math.huge
 
     for _, prompt in candidates do
-        if not isBlacklisted(prompt) then
-            if not root then
-                best = prompt
-                break
-            end
+        if not root then
+            best = prompt
+            break
+        end
 
-            local part = getPromptPart(prompt)
-            if part then
-                local distance = (root.Position - part.Position).Magnitude
-                if distance < bestDistance then
-                    best, bestDistance = prompt, distance
-                end
-            elseif not best then
-                best = prompt
+        local part = getPromptPart(prompt)
+        if part then
+            local distance = (root.Position - part.Position).Magnitude
+            if distance < bestDistance then
+                best, bestDistance = prompt, distance
             end
+        elseif not best then
+            best = prompt
         end
     end
 
@@ -373,9 +517,12 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
     options = options or {}
     local usePathfinding = options.UsePathfinding ~= false
     local allowJumps = options.AllowJumps ~= false
+    local sampleApproaches = options.SampleApproaches == true
+    local requireLineOfSight = options.RequireLineOfSight == true
+    local ignoredTarget = options.IgnoreInstance
 
-    local _, humanoid, root = getCharacter(10)
-    if not humanoid or not root then
+    local character, humanoid, root = getCharacter(10)
+    if not character or not humanoid or not root then
         return false, "character unavailable"
     end
 
@@ -387,16 +534,123 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
     local lastGoal = nil
     local lastMoveAt = 0
     local lastJumpAt = 0
+    local lastObstacleJumpAt = 0
     local jumpAttemptIndex = 0
     local jumpAttemptAt = 0
     local lastPos = root.Position
     local lastProgressAt = startedAt
     local directVisualGoal = nil
+    local fallbackGoal = nil
+    local approachAttempt = 0
 
     local function horiz(a, b)
         local dx = a.X - b.X
         local dz = a.Z - b.Z
         return math.sqrt(dx * dx + dz * dz)
+    end
+
+    local function raycastFilter()
+        local filter = { character }
+        if PathVisualFolder then
+            filter[#filter + 1] = PathVisualFolder
+        end
+        if AssistRampFolder then
+            filter[#filter + 1] = AssistRampFolder
+        end
+        if ignoredTarget then
+            filter[#filter + 1] = ignoredTarget
+        end
+        return filter
+    end
+
+    local function hasLineOfSight(target)
+        if not requireLineOfSight then
+            return true
+        end
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = raycastFilter()
+        local origin = root.Position + Vector3.new(0, 1.25, 0)
+        return Workspace:Raycast(origin, target - origin, params) == nil
+    end
+
+    local function projectToClearFloor(sample, target)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = raycastFilter()
+
+        local origin = Vector3.new(sample.X, target.Y + 16, sample.Z)
+        local floorHit = Workspace:Raycast(origin, Vector3.new(0, -64, 0), params)
+        if not floorHit or floorHit.Normal.Y < 0.45 then
+            return nil
+        end
+
+        local clearanceOrigin = floorHit.Position + Vector3.new(0, 0.25, 0)
+        local ceiling = Workspace:Raycast(
+            clearanceOrigin,
+            Vector3.new(0, Config.ApproachClearanceHeight, 0),
+            params
+        )
+        if ceiling then
+            return nil
+        end
+
+        local expectedRoot = floorHit.Position + Vector3.new(0, 4, 0)
+        if (expectedRoot - target).Magnitude > stopDistance + 0.75 then
+            return nil
+        end
+
+        return floorHit.Position
+    end
+
+    local function getApproachGoals(target)
+        if not sampleApproaches then
+            return { target }
+        end
+
+        local goals = {}
+        for i = 1, Config.ApproachSamples do
+            local angle = ((i - 1) / Config.ApproachSamples) * math.pi * 2
+            local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * Config.ApproachSampleRadius
+            local projected = projectToClearFloor(target + offset, target)
+            if projected then
+                goals[#goals + 1] = projected
+            end
+        end
+
+        local center = projectToClearFloor(target, target)
+        if center then
+            goals[#goals + 1] = center
+        end
+
+        if #goals == 0 then
+            goals[1] = target
+        end
+        return goals
+    end
+
+    local function hasJumpableObstacle(goal)
+        local flatDirection = Vector3.new(
+            goal.X - root.Position.X,
+            0,
+            goal.Z - root.Position.Z
+        )
+        if flatDirection.Magnitude < 0.1 then
+            return false
+        end
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = raycastFilter()
+
+        local direction = flatDirection.Unit * Config.ObstacleCheckDistance
+        local lowOrigin = root.Position - Vector3.new(0, 2.25, 0)
+        local headOrigin = root.Position + Vector3.new(0, 1.75, 0)
+        local lowHit = Workspace:Raycast(lowOrigin, direction, params)
+        local headHit = Workspace:Raycast(headOrigin, direction, params)
+
+        return lowHit ~= nil, lowHit, headHit
     end
 
     local function finish(ok, reason)
@@ -410,43 +664,71 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
     end
 
     local function computePath(target)
-        local created, path = pcall(function()
-            return PathfindingService:CreatePath({
+        local candidates = getApproachGoals(target)
+        local validPaths = {}
+
+        for candidateIndex, candidate in candidates do
+            local path = PathfindingService:CreatePath({
                 AgentRadius = 2,
                 AgentHeight = 5,
                 AgentCanJump = true,
                 WaypointSpacing = Config.WaypointSpacing,
             })
-        end)
+            local computed = pcall(function()
+                path:ComputeAsync(root.Position, candidate)
+            end)
 
-        if not created or not path then
-            return false
+            if computed and path.Status == Enum.PathStatus.Success then
+                local points = path:GetWaypoints()
+                if #points > 0 then
+                    local length = 0
+                    local jumps = 0
+                    local previous = root.Position
+                    for _, waypoint in points do
+                        length += (waypoint.Position - previous).Magnitude
+                        previous = waypoint.Position
+                        if waypoint.Action == Enum.PathWaypointAction.Jump then
+                            jumps += 1
+                        end
+                    end
+                    validPaths[#validPaths + 1] = {
+                        goal = candidate,
+                        points = points,
+                        score = length + jumps * 3 + candidateIndex * 0.01,
+                    }
+                end
+            end
         end
 
-        local computed = pcall(function()
-            path:ComputeAsync(root.Position, target)
+        table.sort(validPaths, function(a, b)
+            return a.score < b.score
         end)
 
-        if computed and path.Status == Enum.PathStatus.Success then
-            local computedWaypoints = path:GetWaypoints()
-            if #computedWaypoints > 0 then
-                waypoints = computedWaypoints
-                index = 1
-                pathGoal = target
-                jumpAttemptIndex = 0
-                jumpAttemptAt = 0
-                directVisualGoal = nil
-                renderPathVisual(root.Position, waypoints, index, target)
-                return true
-            end
+        if #validPaths > 0 then
+            local selectedIndex = (approachAttempt % #validPaths) + 1
+            local selected = validPaths[selectedIndex]
+            waypoints = selected.points
+            fallbackGoal = selected.goal
+            index = 1
+            pathGoal = target
+            jumpAttemptIndex = 0
+            jumpAttemptAt = 0
+            directVisualGoal = nil
+            renderPathVisual(root.Position, waypoints, index, target)
+            clearAssistRamps()
+            buildAssistRamps(waypoints)
+            return true
         end
 
         waypoints = {}
         index = 1
         nextPathAt = os.clock() + 1
+        fallbackGoal = candidates[(approachAttempt % #candidates) + 1]
         if not directVisualGoal or (directVisualGoal - target).Magnitude > 1 then
             directVisualGoal = target
-            renderPathVisual(root.Position, {}, 1, target)
+            renderPathVisual(root.Position, {
+                { Position = fallbackGoal },
+            }, 1, target)
         end
         return false
     end
@@ -458,12 +740,12 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         end
 
         if not root.Parent or humanoid.Health <= 0 then
-            local _, newHumanoid, newRoot = getCharacter(10)
-            if not newHumanoid or not newRoot then
+            local newCharacter, newHumanoid, newRoot = getCharacter(10)
+            if not newCharacter or not newHumanoid or not newRoot then
                 return finish(false, "character respawn failed")
             end
 
-            humanoid, root = newHumanoid, newRoot
+            character, humanoid, root = newCharacter, newHumanoid, newRoot
             waypoints = {}
             index = 1
             nextPathAt = 0
@@ -482,14 +764,14 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         local flat = horiz(root.Position, target)
         local deltaY = target.Y - root.Position.Y
 
-        if flat <= stopDistance and math.abs(deltaY) <= 7 then
+        if (root.Position - target).Magnitude <= stopDistance and hasLineOfSight(target) then
             return finish(true)
         end
 
         local goal
         local activeWaypoint
 
-        if flat <= Config.DirectMoveRange and math.abs(deltaY) <= 2.5 then
+        if not sampleApproaches and flat <= Config.DirectMoveRange and math.abs(deltaY) <= 2.5 then
             waypoints = {}
             index = 1
             goal = target
@@ -504,6 +786,9 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
 
                 if #waypoints == 0 or stale or exhausted then
                     if now >= nextPathAt then
+                        if exhausted and #waypoints > 0 then
+                            approachAttempt += 1
+                        end
                         computePath(target)
                         nextPathAt = os.clock() + 0.5
                     end
@@ -534,7 +819,7 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
                 activeWaypoint = (index <= #waypoints) and waypoints[index] or nil
             end
 
-            goal = activeWaypoint and activeWaypoint.Position or target
+            goal = activeWaypoint and activeWaypoint.Position or fallbackGoal or target
         end
 
         local moved = (root.Position - lastPos).Magnitude
@@ -545,12 +830,35 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         elseif now - lastProgressAt >= Config.StuckWindow then
             lastProgressAt = now
 
+            if Config.AssistRamps and #waypoints > 0 then
+                local bottomFloor = root.Position - Vector3.new(0, 4, 0)
+                local emergencyTop = nil
+                for j = index, math.min(index + 4, #waypoints) do
+                    local point = waypoints[j].Position
+                    if point.Y - bottomFloor.Y >= 0.75
+                        and horiz(root.Position, point) <= 20
+                        and (not emergencyTop or point.Y > emergencyTop.Y) then
+                            emergencyTop = point
+                    end
+                end
+
+                if emergencyTop then
+                    local direction = emergencyTop - bottomFloor
+                    if Vector3.new(direction.X, 0, direction.Z).Magnitude < 0.1 then
+                        direction = root.CFrame.LookVector
+                    end
+                    createAssistRamp(bottomFloor, emergencyTop, direction)
+                end
+            end
+
             if usePathfinding then
+                approachAttempt += 1
                 waypoints = {}
                 index = 1
                 nextPathAt = 0
                 jumpAttemptIndex = 0
                 jumpAttemptAt = 0
+                lastJumpAt = 0
                 clearPathVisual()
             end
 
@@ -560,6 +868,7 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
         local moveGoal = goal
         local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
         local wantsJump = false
+        local obstacleJump = false
 
         if allowJumps and grounded then
             if activeWaypoint
@@ -568,11 +877,45 @@ local function moveNear(getTargetPosition, stopDistance, timeout, options)
                 wantsJump = true
             elseif deltaY >= Config.HeightJumpThreshold and deltaY <= Config.MaxHeightJump and flat <= 16 then
                 wantsJump = true
+            elseif now - lastObstacleJumpAt >= Config.ObstacleJumpCooldown
+                then
+                    local jumpable, obstacleHit, headHit = hasJumpableObstacle(moveGoal)
+                    if jumpable then
+                        -- With head clearance, jump normally. If the head ray
+                        -- is also blocked, skip the doomed jump and use a ramp.
+                        wantsJump = headHit == nil
+                        obstacleJump = wantsJump
+
+                        if Config.AssistRamps
+                            and obstacleHit
+                            and obstacleHit.Instance:IsA("BasePart") then
+                                local forward = Vector3.new(
+                                    moveGoal.X - root.Position.X,
+                                    0,
+                                    moveGoal.Z - root.Position.Z
+                                )
+                                if forward.Magnitude > 0.1 then
+                                    forward = forward.Unit
+                                    local obstacle = obstacleHit.Instance
+                                    local topY = obstacle.Position.Y + obstacle.Size.Y * 0.5
+                                    local bottomFloor = root.Position - Vector3.new(0, 4, 0)
+                                    local topFloor = Vector3.new(
+                                        obstacleHit.Position.X + forward.X * 2,
+                                        topY,
+                                        obstacleHit.Position.Z + forward.Z * 2
+                                    )
+                                    createAssistRamp(bottomFloor, topFloor, forward)
+                                end
+                        end
+                    end
             end
         end
 
         if wantsJump and now - lastJumpAt >= Config.JumpCooldown then
             lastJumpAt = now
+            if obstacleJump then
+                lastObstacleJumpAt = now
+            end
             if activeWaypoint and activeWaypoint.Action == Enum.PathWaypointAction.Jump then
                 jumpAttemptIndex = index
                 jumpAttemptAt = now
@@ -617,6 +960,7 @@ end
 
 local DialogPackets = nil
 local StartMinigame = nil
+local DialogUI = nil
 
 local function loadDependencies()
     local packets = waitForChild(ReplicatedStorage, "Packets", 10)
@@ -725,8 +1069,24 @@ local function cancelDialog()
         return
     end
 
+    -- DialogResult packets bypass the UI coroutine that normally closes the
+    -- panel. Close it through the game's controller, then send the client's
+    -- real dialog-cancel acknowledgement packet.
+    if getDialog() then
+        task.spawn(function()
+            pcall(function()
+                if not DialogUI then
+                    DialogUI = require(ReplicatedStorage.Modules.UI.DialogUI)
+                end
+                if DialogUI and type(DialogUI.CancelDialog) == "function" then
+                    DialogUI.CancelDialog("bones-watermelon")
+                end
+            end)
+        end)
+    end
+
     pcall(function()
-        DialogPackets.CancelDialog.send()
+        DialogPackets.DialogCanceled.send()
     end)
 end
 
@@ -870,6 +1230,7 @@ local function startMinigameDialog(prompt)
 end
 
 local function enterRoutine()
+    clearAssistRamps()
     resetDialog(1.5)
     setPhase("returning_to_lime")
 
@@ -1001,6 +1362,7 @@ local function waitForRoundEnd()
     State.RoundActive = false
     State.RoundEnds += 1
     State.NextEnterAt = os.clock() + Config.EnterCooldown
+    clearAssistRamps()
     setPhase("idle")
     resetDialog(1)
 end
@@ -1013,12 +1375,16 @@ local function collectRoutine(prompt)
         return false, "watermelon part unavailable"
     end
 
-    local stopDistance = math.min(3.5, math.max(2, prompt.MaxActivationDistance - 1.5))
+    local stopDistance = math.max(3.5, prompt.MaxActivationDistance - 1.25)
+    local targetContainer = targetPart:FindFirstAncestor("Watermelon") or targetPart.Parent
     local moved, moveError = moveNear(function()
         return targetPart.Parent and targetPart.Position or nil
     end, stopDistance, Config.MoveTimeout, {
         UsePathfinding = true,
         AllowJumps = true,
+        SampleApproaches = true,
+        RequireLineOfSight = prompt.RequiresLineOfSight,
+        IgnoreInstance = targetContainer,
     })
 
     if not moved then
@@ -1155,9 +1521,8 @@ local function step()
         if not ok then
             State.LastError = reason
             log(reason)
-            if reason ~= "watermelon disappeared" then
-                blacklistPrompt(prompt)
-            end
+            -- This event only exposes one required target. Never blacklist a
+            -- difficult spawn; rotate approach paths and keep retrying it.
             task.wait(Config.RetryDelay)
         else
             State.LastError = nil
